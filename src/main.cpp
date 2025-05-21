@@ -1,100 +1,139 @@
 #include <Arduino.h>
-#include <WiFi.h>      // Til Wi-Fi
-#include <time.h>      // Til NTP-tid
+#include <WiFi.h>
+#include <time.h>
+#include "esp_sleep.h"
 
 // === Wi-Fi credentials ===
-const char* ssid = "IoT_H3/4";        
-const char* password = "98806829";    
+const char* ssid = "IoT_H3/4";
+const char* password = "98806829";
 
-// === Hardware opsætning ===
-const int buttonPins[] = {27, 26, 25, 33};   // GPIO for knapper
-const int ledPins[]    = {5, 18, 19, 21};    // GPIO for LED'er
+// === GPIO pin config ===
+const int buttonPins[] = {27, 26, 25, 33};
+const int ledPins[]    = {5, 18, 19, 21};
 const int numButtons = 4;
 
-bool buttonPressed = false;
-unsigned long lastPressTime = 0;
-const unsigned long lockoutDuration = 7000;  // 7 sekunder lås efter tryk
+// === Timing ===
+const unsigned long ledDuration = 7000;
+const unsigned long stayAwakeDuration = 10 * 60 * 1000; // 10 min
 
-// === Fremad-deklaration ===
-void printCurrentTime();  // <- Korrekt placering: udenfor setup()
+RTC_DATA_ATTR bool activePeriod = false;
+RTC_DATA_ATTR unsigned long bootTime = 0;
+
+int lastButton = -1;
+unsigned long awakeStart = 0;
+
+void connectWiFiAndPrintTime();
+void goToDeepSleep();
 
 void setup() {
   Serial.begin(115200);
-  delay(1000);
+  delay(200);
 
-  // === Setup GPIO ===
   for (int i = 0; i < numButtons; i++) {
-    pinMode(buttonPins[i], INPUT_PULLUP);   // Knap til GND
-    pinMode(ledPins[i], OUTPUT);            // LED output
-    digitalWrite(ledPins[i], LOW);          // LED slukket ved start
+    pinMode(buttonPins[i], INPUT_PULLUP);
+    pinMode(ledPins[i], OUTPUT);
+    digitalWrite(ledPins[i], LOW);
   }
 
-  // === Tilslut Wi-Fi ===
-  Serial.println("Tilslutter Wi-Fi...");
-  WiFi.begin(ssid, password);
+  esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
+  awakeStart = millis();
 
-  int retryCount = 0;
-  while (WiFi.status() != WL_CONNECTED && retryCount < 20) {
-    delay(500);
-    Serial.print(".");
-    retryCount++;
-  }
-
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.println(" Wi-Fi forbundet!");
-    Serial.print("IP-adresse: ");
-    Serial.println(WiFi.localIP());
-  } else {
-    Serial.println(" Wi-Fi kunne ikke tilsluttes.");
-    return;
-  }
-
-  // === Synkronisér tid med NTP-server og dansk tidszone ===
-  configTzTime("CET-1CEST,M3.5.0/02,M10.5.0/03", "pool.ntp.org", "time.nist.gov");
-
-  Serial.print(" Venter på tidssynkronisering");
-  while (time(nullptr) < 100000) {
-    Serial.print(".");
-    delay(500);
-  }
-  Serial.println("\n⏰ Tid synkroniseret!");
-}
-
-void loop() {
-  if (!buttonPressed) {
+  if (cause == ESP_SLEEP_WAKEUP_EXT1) {
+    // Woken by button
     for (int i = 0; i < numButtons; i++) {
       if (digitalRead(buttonPins[i]) == LOW) {
         delay(20); // debounce
         if (digitalRead(buttonPins[i]) == LOW) {
+          lastButton = i;
+          activePeriod = true;
+          Serial.printf("Knap %d trykket – LED tændes\n", i + 1);
           digitalWrite(ledPins[i], HIGH);
-          lastPressTime = millis();
-          buttonPressed = true;
-
-          Serial.printf("Knap %d trykket – LED tændes i 7 sekunder\n", i + 1);
-          printCurrentTime();
+          connectWiFiAndPrintTime();
+          delay(ledDuration);
+          digitalWrite(ledPins[i], LOW);
           break;
         }
       }
     }
   } else {
-    if (millis() - lastPressTime >= lockoutDuration) {
-      for (int i = 0; i < numButtons; i++) {
-        digitalWrite(ledPins[i], LOW);
+    Serial.println("Første opstart eller timer – tjekker knapper...");
+
+    for (int i = 0; i < numButtons; i++) {
+      if (digitalRead(buttonPins[i]) == LOW) {
+        delay(20);
+        if (digitalRead(buttonPins[i]) == LOW) {
+          lastButton = i;
+          activePeriod = true;
+          Serial.printf(" Knap %d blev trykket – starter aktiv periode\n", i + 1);
+          digitalWrite(ledPins[i], HIGH);
+          connectWiFiAndPrintTime();
+          delay(ledDuration);
+          digitalWrite(ledPins[i], LOW);
+          break;
+        }
       }
-      buttonPressed = false;
-      Serial.println("System klar til ny feedback");
     }
   }
 }
 
-void printCurrentTime() {
-  struct tm timeinfo;
-  if (!getLocalTime(&timeinfo)) {
-    Serial.println(" Kunne ikke hente tid.");
-    return;
+void loop() {
+  if (!activePeriod) {
+    goToDeepSleep(); // ikke aktiv periode – gå i dvale
   }
-  char timeStr[64];
-  strftime(timeStr, sizeof(timeStr), "%Y-%m-%d %H:%M:%S", &timeinfo);
-  Serial.print(" Aktuel tid: ");
-  Serial.println(timeStr);
+
+  if (millis() - awakeStart >= stayAwakeDuration) {
+    Serial.println(" Aktiv periode er slut – går i dvale");
+    activePeriod = false;
+    goToDeepSleep();
+  }
+
+  // Reager på andre knapper under aktiv periode
+  for (int i = 0; i < numButtons; i++) {
+    if (digitalRead(buttonPins[i]) == LOW) {
+      delay(20);
+      if (digitalRead(buttonPins[i]) == LOW) {
+        Serial.printf("🔁 Ny knap %d trykket – tænd LED og vis tid\n", i + 1);
+        digitalWrite(ledPins[i], HIGH);
+        connectWiFiAndPrintTime();
+        delay(ledDuration);
+        digitalWrite(ledPins[i], LOW);
+      }
+    }
+  }
+}
+
+void goToDeepSleep() {
+  Serial.println("💤 Går i deep sleep...");
+
+  esp_sleep_enable_ext1_wakeup(
+    (1ULL << buttonPins[0]) | (1ULL << buttonPins[1]) |
+    (1ULL << buttonPins[2]) | (1ULL << buttonPins[3]),
+    ESP_EXT1_WAKEUP_ALL_LOW
+  );
+
+  delay(1000);
+  esp_deep_sleep_start();
+}
+
+void connectWiFiAndPrintTime() {
+  WiFi.begin(ssid, password);
+  int retries = 0;
+  while (WiFi.status() != WL_CONNECTED && retries < 20) {
+    delay(500);
+    retries++;
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    configTzTime("CET-1CEST,M3.5.0/02,M10.5.0/03", "pool.ntp.org");
+    while (time(nullptr) < 100000) delay(500);
+
+    struct tm timeinfo;
+    if (getLocalTime(&timeinfo)) {
+      char buf[64];
+      strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &timeinfo);
+      Serial.printf("Tid: %s\n", buf);
+    }
+  } else {
+    Serial.println("Wi-Fi kunne ikke tilsluttes.");
+  }
 }
